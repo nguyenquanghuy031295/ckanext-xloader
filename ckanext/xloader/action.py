@@ -57,6 +57,7 @@ def xloader_submit(context, data_dict):
 
     :rtype: bool
     '''
+    import re
     schema = context.get('schema', ckanext.xloader.schema.xloader_submit_schema())
     data_dict, errors = _validate(data_dict, schema, context)
     if errors:
@@ -74,6 +75,13 @@ def xloader_submit(context, data_dict):
         return False
 
     site_url = config['ckan.site_url']
+    root_path = config.get('ckan.root_path', None)
+    if root_path:
+      root_path = re.sub('/{{LANG}}', '', root_path)
+      if root_path[-1] == '/':
+        root_path = root_path[:-1]
+      site_url = site_url + root_path
+      
     callback_url = site_url + '/api/3/action/xloader_hook'
 
     site_user = p.toolkit.get_action('get_site_user')({'ignore_auth': True}, {})
@@ -109,7 +117,6 @@ def xloader_submit(context, data_dict):
             datetime.timedelta(seconds=int(
                 config.get('ckanext.xloader.assume_task_stillborn_after', 5)))
         if existing_task.get('state') == 'pending':
-            import re  # here because it takes a moment to load
             queued_res_ids = [
                 re.search(r"'resource_id': u?'([^']+)'",
                           job.description).groups()[0]
