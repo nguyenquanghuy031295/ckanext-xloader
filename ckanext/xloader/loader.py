@@ -305,7 +305,7 @@ def load_table(table_filepath, resource_id, mimetype='text/csv', encoding=None, 
                 for f in existing.get('fields', []) if 'info' in f)
 
         # Some headers might have been converted from strings to floats and such.
-        headers = encode_headers(headers)
+        # headers = encode_headers(headers)
 
         row_set.register_processor(messytables.headers_processor(headers))
         row_set.register_processor(messytables.offset_processor(offset + 1))
