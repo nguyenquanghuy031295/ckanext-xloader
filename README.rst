@@ -260,6 +260,11 @@ Configuration:
     # not be loaded into the datastore.
     ckanext.xloader.max_excerpt_lines = 100
 
+    # Encoding when loading tabular format file
+    # None (default)
+    # Like: 'utf-8', 'latin1', 'latin2', ...
+    ckanext.xloader.encoding = 'cp1250'
+
 ------------------------
 Developer installation
 ------------------------

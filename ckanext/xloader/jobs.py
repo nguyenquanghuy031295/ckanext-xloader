@@ -39,6 +39,7 @@ MAX_CONTENT_LENGTH = int(config.get('ckanext.xloader.max_content_length') or 1e9
 MAX_EXCERPT_LINES = int(config.get('ckanext.xloader.max_excerpt_lines') or 0)
 CHUNK_SIZE = 16 * 1024  # 16kb
 DOWNLOAD_TIMEOUT = 30
+ENCODING_NAME = config.get('ckanext.xloader.encoding')
 
 
 # input = {
@@ -194,6 +195,7 @@ def xloader_data_into_datastore_(input, job_dict):
             loader.load_table(tmp_file.name,
                               resource_id=resource['id'],
                               mimetype=resource.get('format'),
+                              encoding=ENCODING_NAME,
                               logger=logger)
         except JobError as e:
             logger.error('Error during messytables load: {}'.format(e))
@@ -210,6 +212,7 @@ def xloader_data_into_datastore_(input, job_dict):
     logger.info('Loading CSV')
     just_load_with_messytables = asbool(config.get(
         'ckanext.xloader.just_load_with_messytables', False))
+
     logger.info("'Just load with messytables' mode is: {}".format(
         just_load_with_messytables))
     try:

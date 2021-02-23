@@ -265,7 +265,7 @@ def create_column_indexes(fields, resource_id, logger):
     logger.info('...column indexes created.')
 
 
-def load_table(table_filepath, resource_id, mimetype='text/csv', logger=None):
+def load_table(table_filepath, resource_id, mimetype='text/csv', encoding=None, logger=None):
     '''Loads an Excel file (or other tabular data recognized by messytables)
     into Datastore and creates indexes.
 
@@ -283,12 +283,12 @@ def load_table(table_filepath, resource_id, mimetype='text/csv', logger=None):
         #
 
         try:
-            table_set = messytables.any_tableset(tmp, mimetype=ct, extension=ct)
+            table_set = messytables.any_tableset(tmp, mimetype=ct, extension=ct, encoding=encoding)
         except messytables.ReadError as e:
             # try again with format
             tmp.seek(0)
             try:
-                table_set = messytables.any_tableset(tmp, mimetype=format, extension=format)
+                table_set = messytables.any_tableset(tmp, mimetype=format, extension=format, encoding=encoding)
             except Exception as e:
                 raise LoaderError(e)
 
