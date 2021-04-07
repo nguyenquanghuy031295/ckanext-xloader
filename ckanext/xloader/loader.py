@@ -13,6 +13,8 @@ import psycopg2
 import messytables
 from unidecode import unidecode
 
+from openpyxl import load_workbook
+
 import ckan.plugins as p
 from .job_exceptions import LoaderError, FileCouldNotBeLoadedError
 import ckan.plugins.toolkit as tk
@@ -265,6 +267,200 @@ def create_column_indexes(fields, resource_id, logger):
     logger.info('...column indexes created.')
 
 
+def _load_table_others(table_filepath, resource_id, mimetype='text/csv', format='CSV', encoding=None, logger=None):
+  logger.info('Determining column names and types')
+  ct = mimetype
+
+  with open(table_filepath, 'rb') as tmp:
+    #
+    # Copied from datapusher/jobs.py:push_to_datastore
+    #
+
+    try:
+        table_set = messytables.any_tableset(tmp, mimetype=ct, extension=ct, encoding=encoding)
+    except messytables.ReadError as e:
+        # try again with format
+        tmp.seek(0)
+        try:
+            table_set = messytables.any_tableset(tmp, mimetype=format, extension=format, encoding=encoding)
+        except Exception as e:
+            raise LoaderError(e)
+
+    if not table_set.tables:
+        raise LoaderError('Could not parse file as tabular data')
+    row_set = table_set.tables.pop()
+    offset, headers = messytables.headers_guess(row_set.sample)
+
+    existing = datastore_resource_exists(resource_id)
+    existing_info = None
+    if existing:
+        existing_info = dict(
+            (f['id'], f['info'])
+            for f in existing.get('fields', []) if 'info' in f)
+
+    # Some headers might have been converted from strings to floats and such.
+    # headers = encode_headers(headers)
+
+    row_set.register_processor(messytables.headers_processor(headers))
+    row_set.register_processor(messytables.offset_processor(offset + 1))
+    TYPES, TYPE_MAPPING = get_types()
+    types = messytables.type_guess(row_set.sample, types=TYPES, strict=True)
+
+    # override with types user requested
+    if existing_info:
+        types = [{
+            'text': messytables.StringType(),
+            'numeric': messytables.DecimalType(),
+            'timestamp': messytables.DateUtilType(),
+            }.get(existing_info.get(h, {}).get('type_override'), t)
+            for t, h in zip(types, headers)]
+
+    row_set.register_processor(messytables.types_processor(types))
+
+    headers = [header.strip()[:MAX_COLUMN_LENGTH] for header in headers if header.strip()]
+    headers_set = set(headers)
+    
+    def row_iterator():
+        for row in row_set:
+            data_row = {}
+            for index, cell in enumerate(row):
+                column_name = cell.column.strip()
+                if column_name not in headers_set:
+                    continue
+                data_row[column_name] = cell.value
+            yield data_row
+    result = row_iterator()
+    '''
+    Delete existing datstore resource before proceeding. Otherwise
+    'datastore_create' will append to the existing datastore. And if
+    the fields have significantly changed, it may also fail.
+    '''
+    if existing:
+        logger.info('Deleting "{res_id}" from datastore.'.format(
+            res_id=resource_id))
+        delete_datastore_resource(resource_id)
+
+    headers_dicts = [dict(id=field[0], type=TYPE_MAPPING[str(field[1])])
+                      for field in zip(headers, types)]
+
+    # Maintain data dictionaries from matching column names
+    if existing_info:
+        for h in headers_dicts:
+            if h['id'] in existing_info:
+                h['info'] = existing_info[h['id']]
+                # create columns with types user requested
+                type_override = existing_info[h['id']].get('type_override')
+                if type_override in list(_TYPE_MAPPING.values()):
+                    h['type'] = type_override
+
+    logger.info('Determined headers and types: {headers}'.format(
+        headers=headers_dicts))
+
+    # Commented - this is only for tests
+    # if dry_run:
+    #     return headers_dicts, result
+
+    logger.info('Copying to database...')
+    count = 0
+    for i, records in enumerate(chunky(result, 250)):
+        count += len(records)
+        logger.info('Saving chunk {number}'.format(number=i))
+        send_resource_to_datastore(resource_id, headers_dicts, records)
+    logger.info('...copying done')
+
+    if count:
+        logger.info('Successfully pushed {n} entries to "{res_id}".'.format(
+                    n=count, res_id=resource_id))
+    else:
+        # no datastore table is created
+        raise LoaderError('No entries found - nothing to load')
+
+    # Commented - this is done by the caller in jobs.py
+    # if data.get('set_url_type', False):
+    #     update_resource(resource, api_key, ckan_url)
+
+def _load_table_xlsx(table_filepath, resource_id, encoding, logger):
+  from .excel import headers_guess, type_guess
+  logger.info('Determining column names and types')
+
+  wb = load_workbook(filename=table_filepath)
+  ws = wb.worksheets[0]
+
+  rows = list(ws.iter_rows())
+  cols = ws.iter_cols()
+  offset, headers = headers_guess(rows, tolerance=1)
+
+  existing = datastore_resource_exists(resource_id)
+  existing_info = None
+  if existing:
+      existing_info = dict(
+          (f['id'], f['info'])
+          for f in existing.get('fields', []) if 'info' in f)
+
+  types = type_guess(cols, strict=True, header_offset=offset)
+
+  # override with types user requested
+  if existing_info:
+      types = [{
+          'text': messytables.StringType(),
+          'numeric': messytables.DecimalType(),
+          'timestamp': messytables.DateUtilType(),
+          }.get(existing_info.get(h, {}).get('type_override'), t)
+          for t, h in zip(types, headers)]
+
+  headers = [header.strip()[:MAX_COLUMN_LENGTH] for header in headers if header.strip()]
+
+  def data_row_iterator():
+    for index, row in enumerate(rows):
+      data_row = {}
+      if index <= offset:
+        continue
+
+      for hi, header in enumerate(headers):
+        data_row[header] = row[hi].value
+
+      # for ci, cell in enumerate(row):
+      #   column_name = headers[ci]
+      #   data_row[column_name] = cell.value
+      yield data_row
+  
+  data_rows = data_row_iterator()
+
+  if existing:
+    logger.info('Deleting "{res_id}" from datastore.'.format(
+        res_id=resource_id))
+    delete_datastore_resource(resource_id)
+
+  headers_dicts = [dict(id=field[0], type=_TYPE_MAPPING[str(field[1])])
+                    for field in zip(headers, types)]
+  
+  # Maintain data dictionaries from matching column names
+  if existing_info:
+    for h in headers_dicts:
+      if h['id'] in existing_info:
+        h['info'] = existing_info[h['id']]
+        # create columns with types user requested
+        type_override = existing_info[h['id']].get('type_override')
+        if type_override in list(_TYPE_MAPPING.values()):
+            h['type'] = type_override
+  
+  logger.info('Determined headers and types: {headers}'.format(headers=headers_dicts))
+
+  logger.info('Copying to database...')
+  count = 0
+  for i, records in enumerate(chunky(data_rows, 250)):
+      count += len(records)
+      logger.info('Saving chunk {number}'.format(number=i))
+      send_resource_to_datastore(resource_id, headers_dicts, records)
+  logger.info('...copying done')
+
+  if count:
+      logger.info('Successfully pushed {n} entries to "{res_id}".'.format(
+                  n=count, res_id=resource_id))
+  else:
+      # no datastore table is created
+      raise LoaderError('No entries found - nothing to load')
+
 def load_table(table_filepath, resource_id, mimetype='text/csv', encoding=None, logger=None):
     '''Loads an Excel file (or other tabular data recognized by messytables)
     into Datastore and creates indexes.
@@ -273,118 +469,13 @@ def load_table(table_filepath, resource_id, mimetype='text/csv', encoding=None, 
     '''
 
     # use messytables to determine the header row
-    logger.info('Determining column names and types')
-    ct = mimetype
     format = os.path.splitext(table_filepath)[1]  # filename extension
-    with open(table_filepath, 'rb') as tmp:
-
-        #
-        # Copied from datapusher/jobs.py:push_to_datastore
-        #
-
-        try:
-            table_set = messytables.any_tableset(tmp, mimetype=ct, extension=ct, encoding=encoding)
-        except messytables.ReadError as e:
-            # try again with format
-            tmp.seek(0)
-            try:
-                table_set = messytables.any_tableset(tmp, mimetype=format, extension=format, encoding=encoding)
-            except Exception as e:
-                raise LoaderError(e)
-
-        if not table_set.tables:
-            raise LoaderError('Could not parse file as tabular data')
-        row_set = table_set.tables.pop()
-        offset, headers = messytables.headers_guess(row_set.sample)
-
-        existing = datastore_resource_exists(resource_id)
-        existing_info = None
-        if existing:
-            existing_info = dict(
-                (f['id'], f['info'])
-                for f in existing.get('fields', []) if 'info' in f)
-
-        # Some headers might have been converted from strings to floats and such.
-        # headers = encode_headers(headers)
-
-        row_set.register_processor(messytables.headers_processor(headers))
-        row_set.register_processor(messytables.offset_processor(offset + 1))
-        TYPES, TYPE_MAPPING = get_types()
-        types = messytables.type_guess(row_set.sample, types=TYPES, strict=True)
-
-        # override with types user requested
-        if existing_info:
-            types = [{
-                'text': messytables.StringType(),
-                'numeric': messytables.DecimalType(),
-                'timestamp': messytables.DateUtilType(),
-                }.get(existing_info.get(h, {}).get('type_override'), t)
-                for t, h in zip(types, headers)]
-
-        row_set.register_processor(messytables.types_processor(types))
-
-        headers = [header.strip()[:MAX_COLUMN_LENGTH] for header in headers if header.strip()]
-        headers_set = set(headers)
-
-        def row_iterator():
-            for row in row_set:
-                data_row = {}
-                for index, cell in enumerate(row):
-                    column_name = cell.column.strip()
-                    if column_name not in headers_set:
-                        continue
-                    data_row[column_name] = cell.value
-                yield data_row
-        result = row_iterator()
-
-        '''
-        Delete existing datstore resource before proceeding. Otherwise
-        'datastore_create' will append to the existing datastore. And if
-        the fields have significantly changed, it may also fail.
-        '''
-        if existing:
-            logger.info('Deleting "{res_id}" from datastore.'.format(
-                res_id=resource_id))
-            delete_datastore_resource(resource_id)
-
-        headers_dicts = [dict(id=field[0], type=TYPE_MAPPING[str(field[1])])
-                         for field in zip(headers, types)]
-
-        # Maintain data dictionaries from matching column names
-        if existing_info:
-            for h in headers_dicts:
-                if h['id'] in existing_info:
-                    h['info'] = existing_info[h['id']]
-                    # create columns with types user requested
-                    type_override = existing_info[h['id']].get('type_override')
-                    if type_override in list(_TYPE_MAPPING.values()):
-                        h['type'] = type_override
-
-        logger.info('Determined headers and types: {headers}'.format(
-            headers=headers_dicts))
-
-        # Commented - this is only for tests
-        # if dry_run:
-        #     return headers_dicts, result
-
-        logger.info('Copying to database...')
-        count = 0
-        for i, records in enumerate(chunky(result, 250)):
-            count += len(records)
-            logger.info('Saving chunk {number}'.format(number=i))
-            send_resource_to_datastore(resource_id, headers_dicts, records)
-        logger.info('...copying done')
-
-        if count:
-            logger.info('Successfully pushed {n} entries to "{res_id}".'.format(
-                        n=count, res_id=resource_id))
-        else:
-            # no datastore table is created
-            raise LoaderError('No entries found - nothing to load')
-
-        # Commented - this is done by the caller in jobs.py
-        # if data.get('set_url_type', False):
-        #     update_resource(resource, api_key, ckan_url)
+    # XLSX Format
+    if mimetype.lower() == 'xlsx' or format.lower() == '.xlsx':
+      _load_table_xlsx(table_filepath, resource_id, encoding, logger)
+    else:
+      _load_table_others(table_filepath, resource_id, mimetype, format, encoding, logger)
+    
 
 
 _TYPE_MAPPING = {
@@ -393,7 +484,8 @@ _TYPE_MAPPING = {
     # and type detection may not realize it needs to be big
     'Integer': 'numeric',
     'Decimal': 'numeric',
-    'DateUtil': 'timestamp'
+    'DateUtil': 'timestamp',
+    'Bool': 'boolean'
 }
 
 
