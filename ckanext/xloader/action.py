@@ -173,13 +173,15 @@ def xloader_submit(context, data_dict):
             }
         }
     timeout = config.get('ckanext.xloader.job_timeout', '3600')
+    queue = config.get('ckanext.xloader.queue_name', 'xloader-queue')
     try:
         try:
             job = enqueue_job(jobs.xloader_data_into_datastore, [data],
+                              queue=queue,
                               timeout=timeout)
         except TypeError:
             # older ckans didn't allow the timeout keyword
-            job = _enqueue(jobs.xloader_data_into_datastore, [data], timeout=timeout)
+            job = _enqueue(jobs.xloader_data_into_datastore, [data], queue=queue, timeout=timeout)
     except Exception:
         log.exception('Unable to enqueued xloader res_id=%s', res_id)
         model.Session = original_session
